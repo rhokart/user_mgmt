@@ -1,0 +1,196 @@
+def deployable_branches = ["master","develop","test"]
+def deployRepoUrl = "git@bitbucket.org:vaipraadmin/argocd-k8s-templates.git"
+
+pipeline {
+   
+  agent {
+    kubernetes {
+      yaml ''' 
+        apiVersion: v1
+        kind: Pod
+        metadata: 
+          labels:
+            some-label: some-label-value
+        spec:
+          volumes:
+          - name: kaniko-secret
+            secret:
+                secretName: ecr-credentials
+                items:
+                - key: .dockerconfigjson
+                  path: config.json     
+
+          - name: cache
+            persistentVolumeClaim:
+              claimName: maven-cache
+
+          - name: docker-sock
+            hostPath:
+              path: '/var/run/docker.sock'
+
+          tolerations:
+            - effect: NoSchedule
+              key: dedicated 
+              operator: Equal
+              value: "jenkins-slave"
+
+          nodeSelector:
+            purpose: jenkins-slave
+          containers:
+
+          - name: maven 
+            image: maven:3.8.1-jdk-8
+            command:
+            - cat
+            tty: true
+            volumeMounts:
+            - name: cache
+              mountPath: '/root/.m2/repository'
+
+          - name: kubectl-helm-cli  
+            image: baharul1987/cicd-kubectl-helm:latest
+            command:
+            - cat
+            tty: true
+
+          - name: sonarcli
+            image: sonarsource/sonar-scanner-cli:latest
+            command:
+            - cat
+            tty: true
+            volumeMounts:
+            - name: cache
+              mountPath: '/root/.m2/repository'
+
+          - name: git
+            image: jenkins/ssh-agent:jdk11
+            command:
+            - cat
+            tty: true
+
+          - name: argo-cd-tools
+            image: argoproj/argo-cd-tools:latest
+            command:
+            - cat
+            tty: true
+            envVar:
+            - key: GIT_SSH_COMMAND
+              value: "ssh -o StrictHostKeyChecking=no"
+
+          - name: argo-cd-cli
+            image: argoproj/argocd-cli:v0.10.0
+            command:
+            - cat
+            tty: true
+            envVar:
+            - key: ARGOCD_SERVER
+              value: argocdServer
+
+          - name: kaniko
+            image:  gcr.io/kaniko-project/executor:v1.9.0-debug
+            command:
+            - sleep
+            args:
+            - 9999999
+            volumeMounts:
+              - name: kaniko-secret
+                mountPath: /kaniko/.docker/
+          restartPolicy: Never
+        '''
+    }
+  }
+
+
+
+
+    environment {
+        GIT_REPO_NAME = env.GIT_URL.replace('.git', '').split('/').last()
+        branchName = env.GIT_BRANCH.split('/').last()
+        AWS_ACCOUNT_ID=credentials('AWS_ACCOUNT_ID')
+        BITBUCKET_APP_PASSWORD=credentials('BITBUCKET_APP_PASSWORD')
+        AWS_DEFAULT_REGION="ap-south-1"
+        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${GIT_REPO_NAME}"
+        IMAGE_TAG="${BUILD_NUMBER}"
+        argoCdName= GIT_REPO_NAME.replace("_", "-")
+
+    }
+
+
+    stages {
+
+
+        stage("Check branch Eligibility") {
+          steps {
+            script {
+              if (!deployable_branches.contains(branchName)) {
+                println "Branch: ${branchName} is not part of deployable_branches"
+                println "Skipping pipeline"
+                currentBuild.result = 'SUCCESS'
+                return
+              }else{
+                println "Branch: ${branchName} is  part of deployable_branches. Proceeding Further!"
+              }
+            }
+          }
+        }
+
+      stage('Maven Build') {
+          when { expression { true } }
+          steps {
+              container('maven') {
+                  sh 'mvn clean package -Dmaven.test.failure.ignore=true'
+                  sh 'echo aws acccount id is ${AWS_ACCOUNT_ID}'
+              }
+          }
+      }
+
+        stage('Build kaniko image') {
+          steps {
+            container('kaniko') {
+                script {
+                  sh '''
+                    /kaniko/executor --context `pwd` --destination ${REPOSITORY_URI}:${IMAGE_TAG}
+                    /kaniko/executor --context `pwd` --destination ${REPOSITORY_URI}:latest
+                  '''
+                }
+            }
+          }
+          }
+
+
+      stage('Deployment') {
+
+        steps {
+
+                container('argo-cd-tools') {
+                  println("Deploying to ${GIT_REPO_NAME}")
+
+                  dir("deployment-${branchName}") {
+                      withCredentials([file(credentialsId: 'pvt_key', variable: 'pvtKey')]) {
+                          sh "mkdir /root/.ssh/ && ssh-keyscan -t rsa bitbucket.org >> ~/.ssh/known_hosts && cp \$pvtKey /root/.ssh/id_rsa && chmod 400 /root/.ssh/id_rsa"
+                          sh "git clone ${deployRepoUrl}"
+                          sh "cd \$(basename '${deployRepoUrl}' .git) && \
+                          ls -la \
+                          &&  cd ./'${GIT_REPO_NAME}'/'${branchName}' \
+                          && echo \$(pwd) \
+                          && echo '${IMAGE_TAG}' \
+                          && git checkout '${branchName}' \
+                          && sed -i 's#amazonaws.com/'${GIT_REPO_NAME}'.*#amazonaws.com/'${GIT_REPO_NAME}':'${IMAGE_TAG}'#g' values.yaml \
+                          && git config --global user.name 'baharulkhan' \
+                          && git config --global user.email 'baharul87@gmail.com' \
+                          && git add . \
+                          && git commit -am 'Updated the deployment file' \
+                          && git branch \
+                          && git remote set-url origin  http://baharulkhan:${BITBUCKET_APP_PASSWORD}@bitbucket.org/vaipraadmin/argocd-k8s-templates.git \
+                          && git push origin '${branchName}'"
+
+                      }
+                  }
+               }
+        }
+
+      }
+
+    }
+
+}
